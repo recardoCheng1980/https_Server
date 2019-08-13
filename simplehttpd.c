@@ -31,18 +31,12 @@
 
 #define foreach_header(i, h) for( i = 0; (i + 1) < (sizeof(h) / sizeof(h[0])) && h[i]; i += 2 )
 
+#define SOCK_PATH "/tmp/uds"
+
+
 SSL *client_ssl[FD_SETSIZE]={0};
 int ssl_finished[FD_SETSIZE]={0};
 int writefd_clear[FD_SETSIZE]={0};
-
-typedef enum {                                                                     
-  INIT=0,
-  ACCEPT,
-  SSL_ACCEPT,                                                                       
-  SSL_WANT_READ,
-  SSL_WANT_WRITE,                                                                           
-  DONE
-} SSL_HANDSHAKE;   
 
 typedef struct _client_struct {
   char ip[MAXIP]; //key
@@ -162,6 +156,70 @@ static int do_sys_command(char* cmd)
 
 
 
+void http_redir_response_dry(int filedes) {
+  char respData[MAXMSG];
+  char redirect_url[MAXURLMSG];
+  int len;
+  char client_ip[MAXIP]= {0};
+  socklen_t addr_size=sizeof(struct sockaddr_in);
+  struct sockaddr_in addr;
+  int res=getpeername(filedes, (struct sockaddr*)&addr, &addr_size);
+  int i=0;
+
+  strcpy(client_ip, inet_ntoa(addr.sin_addr));
+  foreach_header(i, sHttpReq.headers) {
+    if (!strcasecmp(sHttpReq.headers[i], "Host")) {
+      char cmd[128]= {0};
+      memset(cmd, 0x0, sizeof(cmd));
+      snprintf(cmd, sizeof(cmd)-1, "arp -a -n %s | awk '{printf $4}'", client_ip);
+      client_struct *s=NULL, *tmp = NULL;
+      HASH_FIND_STR( client_list, client_ip, s);
+      if (!s) {
+        if (do_sys_command(cmd)) {
+          if (strlen(mac)==17) {
+            //add to hash table
+            s = (client_struct*)malloc(sizeof(client_struct));
+            strncpy(s->ip, client_ip, MAXIP);
+            strncpy(s->mac, mac, MAXMAC);
+            s->ts=time(NULL);
+            HASH_ADD_STR( client_list, ip, s );
+          }
+        }
+      } else {
+        //update mac for same ip evenry 10 mins
+        time_t now=time(NULL);
+        if ((now - s->ts) > 600) {
+          if (do_sys_command(cmd)) {
+            if (strlen(mac)==17) { 
+              strncpy(s->mac, mac, MAXMAC);
+              s->ts=now;
+            }
+          }
+        }
+        strncpy(mac, s->mac, MAXMAC);
+      }
+
+      memset(redirect_url, 0x0, sizeof(redirect_url));
+      snprintf(redirect_url, sizeof(redirect_url)-1,
+               "%s?node_id=%s&gateway_id=%s&node_mac=%s&client_mac=%s&client_ip=%s&ssid=%s&cont_url=http://%s%s",
+               server_url, node_id, "test", node_mac, mac, client_ip, "1", sHttpReq.headers[i+1], sHttpReq.url);
+      log_print(redirect_url);
+
+      len = snprintf(respData, sizeof(respData),
+                     "HTTP/1.1 200 OK\r\n"
+                     "Connection: close\r\n"
+                     "Content-Type: text/html\r\n"
+                     "Pragma: no-cache\r\n"
+                     "Expires: -1\r\n\r\n"
+                     "<script>window.location.href='%s'</script>", redirect_url
+                    );
+      break;
+    }//Header Host
+  }//foreach_header
+
+  printf("%s\n", respData); 
+}
+
 
 void http_redir_response(int filedes)
 {
@@ -195,6 +253,7 @@ void http_redir_response(int filedes)
           }
         }
       } else {
+
         //check timestamp
         time_t now=time(NULL);
         if ((now - s->ts) > 600) {
@@ -234,8 +293,50 @@ void http_redir_response(int filedes)
         }
       }
     }
+  }//foreach_header
+
+}
+
+int ssl_resp(int fd, int count) {
+  char buffer[MAXMSG];
+  char redirect_url[MAXURLMSG];
+  int len=0;
+
+  printf("ssl_resp:%d\n", fd);
+
+  memset(redirect_url, 0x0, sizeof(redirect_url));
+  snprintf(redirect_url, sizeof(redirect_url)-1, "count:%d", count);
+  len = snprintf(buffer, sizeof(buffer),
+                 "HTTP/1.1 200 OK\r\n"
+                 "Connection: close\r\n"
+                 "Content-Type: text/html\r\n"
+                 "Pragma: no-cache\r\n"
+                 "Expires: -1\r\n\r\n"
+                 "<script>window.location.href='%s'</script>", redirect_url);
+
+  int sslWriteRet=SSL_write(client_ssl[fd], buffer, len);
+  if (sslWriteRet<=0) { //error
+    int sslerror=SSL_get_error(client_ssl[tData.fd], sslWriteRet);
+    printf("[sslWriteRet] sslerror:%d, sslWriteRet:%d, sizeof(data):%d, socket:%d\n", sslerror, sslWriteRet, sizeof(buffer), fd);
+    return sslWriteRet;
+  }
+  printf("ssl write 111\n");
+  BIO *pOutBio= SSL_get_wbio(client_ssl[fd]);                         
+  int bioAvailable=BIO_pending(pOutBio);                             
+  printf("ssl write 222\n");
+
+  if (bioAvailable<0) {                                              
+  }                                                                  
+  else if (bioAvailable>0){
+    char outBuffer[bioAvailable];                                 
+    int written=BIO_read(pOutBio, outBuffer, bioAvailable);       
+    int result=send(fd, outBuffer, bioAvailable, MSG_NOSIGNAL);
+    if (written==result) {
+      writefd_clear[fd]=1; //set flag to let write event finished it. clear it when next wait event
+    }
   }
 }
+
 
 int http_header_parse(int filedes, char *buffer, int buflen)
 {
@@ -410,6 +511,13 @@ int read_from_client (int filedes, char* buffer, int msgsize)
   }
 }
 
+void shutdownConnection(int fd) {
+  close(fd);
+  SSL_free(client_ssl[fd]);
+  client_ssl[fd]=NULL;
+  ssl_finished[fd]=0;    
+}
+
 int main (int argc, char **argv)
 {
   int sock;
@@ -505,7 +613,6 @@ int main (int argc, char **argv)
       continue;
     }
     else {
-      //log_print("select fd");
       /* Service all the sockets with input pending. */
       for (i = 0; i < FD_SETSIZE; ++i) {
         if (FD_ISSET (i, &readfd_set)) {
@@ -554,46 +661,28 @@ int main (int argc, char **argv)
             printf("socket:%d, read_size:%d\n", i, read_size);
 
             /* Data arriving on an already-connected socket. */
-            if (read_size < 0) {
+            if (read_size <=0 ) {
               //log_print("[read_size< 0] Client read error, we close client socket");
-              printf("[read_size<0] Client read error, we close client socket:%d\n", i);
-              close (i);
-              SSL_free(client_ssl[i]);                                          
-              client_ssl[i]=NULL;
-              ssl_finished[i]=0;     
+              printf("[read_size<=0] Client read error/Client disconnect, we close client socket:%d\n", i);
+              shutdownConnection(i);
+              FD_CLR (i, &active_writefd_set);
+              FD_CLR (i, &active_readfd_set);
               writefd_clear[i]=1;
-              FD_CLR (i, &active_writefd_set);
-              FD_CLR (i, &active_readfd_set);
-            }
-            else if (read_size==0) {
-              //log_print("[read_size==0] Client disconnect, we close client socket");
-              printf("[read_size==0] Client disconnect, we close client socket:%d\n", i);
-              close (i);
-              SSL_free(client_ssl[i]);                                          
-              client_ssl[i]=NULL;
-              ssl_finished[i]=0;     
-              writefd_clear[i]=0;
-              FD_CLR (i, &active_writefd_set);
-              FD_CLR (i, &active_readfd_set);
             }
             else {//read_size>0
-              //handle ssl handshake
               BIO *pInBio = SSL_get_rbio(client_ssl[i]);
               BIO_write(pInBio, buffer, read_size);
 
               if (!ssl_finished[i]) {
+                //DoHandshake
                 int errorCode=SSL_accept(client_ssl[i]);
                 if (errorCode < 0) {                                               
                   int sslError = SSL_get_error(client_ssl[i], errorCode);             
                   if (sslError != SSL_ERROR_WANT_READ && sslError != SSL_ERROR_WANT_WRITE) {
-                    //printf("SSL_read, unable to accept SSL connection: %d", sslError);
-                    close(i);
-                    SSL_free(client_ssl[i]);
-                    client_ssl[i]=NULL;
-                    ssl_finished[i]=0;     
-                    writefd_clear[i]=0;
+                    shutdownConnection(i);
                     FD_CLR(i, &active_readfd_set);
                     FD_CLR(i, &active_writefd_set);
+                    writefd_clear[i]=0;
                     break;
                   }                                                         
                 }   
@@ -603,15 +692,14 @@ int main (int argc, char **argv)
                 int bioAvailable=BIO_pending(pOutBio);
                 if (bioAvailable<0) {                                              
                   printf("bioAvailable failed:%d\n", i);
-                  //log_print("bioAvailable failed");
-                  close(i);
-                  SSL_free(client_ssl[i]);
-                  client_ssl[i]=NULL;
-                  ssl_finished[i]=0;       
-                  writefd_clear[i]=0;
+                  shutdownConnection(i);
                   FD_CLR(i, &active_writefd_set);
                   FD_CLR(i, &active_readfd_set);
+                  writefd_clear[i]=0;
                 }                                                                  
+                else if (bioAvailable==0) {
+                  ssl_finished[i]=SSL_is_init_finished(client_ssl[i]);       
+                }
                 else if (bioAvailable>0){                                          
                   char outBuffer[bioAvailable];                                    
                   int written=BIO_read(pOutBio, outBuffer, bioAvailable);          
@@ -620,44 +708,62 @@ int main (int argc, char **argv)
                 }                                                                  
               }//ssl is not finished
 
-              else {
-                char data[280]={0};
-                snprintf(data, sizeof(data), "%s", "HTTP/1.1 200 OK\r\nContent-Length: 30\r\nServer: EKRServer\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<html><body>abcd</body></html>");
-                int sslWriteRet=SSL_write(client_ssl[i], data, sizeof(data));
+              if (ssl_finished[i]) {
+                char readData[MAXMSG]={0};
+                int readSize=0;
 
-                if (sslWriteRet<=0) { //error
-                  int sslerror=SSL_get_error(client_ssl[i], sslWriteRet);
-                  printf("[sslWriteRet] sslerror:%d, sslWriteRet:%d, sizeof(data):%d, socket:%d\n", sslerror, sslWriteRet, sizeof(data), i);
-                  close(i);
-                  SSL_free(client_ssl[i]);                                          
-                  client_ssl[i]=NULL;
-                  ssl_finished[i]=0;     
-                  writefd_clear[i]=0;
-                  FD_CLR(i, &active_readfd_set);
-                  FD_CLR(i, &active_writefd_set);
-                  break;
-                }
-                else {
-                  //performIO                                                        
-                  BIO *pOutBio= SSL_get_wbio(client_ssl[i]);                         
-                  int bioAvailable=BIO_pending(pOutBio);                             
-                  //printf("complete bioAvailable :%d\n", bioAvailable);               
-                  if (bioAvailable<0) {                                              
-                    //printf("complete bioAvailable failed");                          
-                  }                                                                  
-                  else if (bioAvailable>0){
-                    char outBuffer[bioAvailable];                                 
-                    int written=BIO_read(pOutBio, outBuffer, bioAvailable);       
-                    //printf("complete written :%d\n", written);                    
-                    int result=send(i, outBuffer, bioAvailable, MSG_NOSIGNAL);
-                    //printf("complete send result:%d\n", result);                  
-                    if (written==result) {
-                      writefd_clear[i]=1; //set flag to let write event finished it. clear it when next wait event
+                while((readSize=SSL_read(client_ssl[i], readData, MAXMSG))>0) {
+                  char data[280]={0};
+                  if (readSize<MAXMSG) {
+                    int result=http_header_parse(i, readData, readSize);
+                    printf("http parse result:%d\n", result);
+                    if (result!=0) {
+                      shutdownConnection(i);
+                      FD_CLR(i, &active_writefd_set);
+                      FD_CLR(i, &active_readfd_set);
+                      writefd_clear[i]=0;
+                      break;
                     }
-                  }
-                }
-              }//ssl finished
+                    
+                    pthread_mutex_lock(&signal_mutex);
+                    tData.fd=i;
+                    pthread_cond_signal(&cond);
+                    pthread_mutex_unlock(&signal_mutex);
+      
+                    FD_CLR(i, &active_writefd_set);
+                    //http_redir_response_dry(i);
 
+                    
+                    //snprintf(data, sizeof(data), "%s", "HTTP/1.1 200 OK\r\nContent-Length: 30\r\nServer: EKRServer\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<html><body>abcd</body></html>");
+                    //int sslWriteRet=SSL_write(client_ssl[i], data, sizeof(data));
+  
+                    //if (sslWriteRet<=0) { //error
+                    //  int sslerror=SSL_get_error(client_ssl[i], sslWriteRet);
+                    //  printf("[sslWriteRet] sslerror:%d, sslWriteRet:%d, sizeof(data):%d, socket:%d\n", sslerror, sslWriteRet, sizeof(data), i);
+                    //  shutdownConnection(i);
+                    //  FD_CLR(i, &active_readfd_set);
+                    //  FD_CLR(i, &active_writefd_set);
+                    //  writefd_clear[i]=0;
+                    //  break;
+                    //}
+                    //else {
+                    //  BIO *pOutBio= SSL_get_wbio(client_ssl[i]);                         
+                    //  int bioAvailable=BIO_pending(pOutBio);                             
+                    //  if (bioAvailable<0) {                                              
+                    //  }                                                                  
+                    //  else if (bioAvailable>0){
+                    //    char outBuffer[bioAvailable];                                 
+                    //    int written=BIO_read(pOutBio, outBuffer, bioAvailable);       
+                    //    int result=send(i, outBuffer, bioAvailable, MSG_NOSIGNAL);
+                    //    if (written==result) {
+                    //      writefd_clear[i]=1; //set flag to let write event finished it. clear it when next wait event
+                    //    }
+                    //  }
+                    //}
+
+		  }//read messge size check
+                }//SSL read finished
+              }//ssl finished
             }//read_size>0
           }//accepted connection socket
         }//read fd set
@@ -671,20 +777,29 @@ int main (int argc, char **argv)
             if (writefd_clear[i]) {
               //log_print("write event raised, close socket");
               printf("write event raised, close socket:%d\n", i);
-              close(i);                                                        
-              SSL_free(client_ssl[i]);
-              client_ssl[i]=NULL;
-              ssl_finished[i]=0;
-              writefd_clear[i]=0;
+              shutdownConnection(i);
               FD_CLR(i, &active_readfd_set); //remove from select list
               FD_CLR(i, &active_writefd_set); //remove from select list
+              writefd_clear[i]=0;
+            }
+            else {
+              if (tData.done&&tData.fd==i) {
+                printf("write event raised, response data:%d\n", i);
+                int sslWriteRet=0;
+                if ((sslWriteRet=ssl_resp(tData.fd, tData.count))<=0) {
+                  shutdownConnection(tData.fd);
+                  FD_CLR(tData.fd, &active_readfd_set);
+                  FD_CLR(tData.fd, &active_writefd_set);
+                  writefd_clear[tData.fd]=0;
+                }
+                tData.fd=0;
+                tData.done=0;
+              }
             }
           }
 	}//write fd set
-
       }//for loop
     }//select 
-
   }//while
 }
 

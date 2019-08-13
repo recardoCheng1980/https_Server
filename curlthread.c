@@ -4,6 +4,7 @@
 
 pthread_mutex_t signal_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+threadData tData={0, 1000, 0};
 
 void init_string(curlString *s) {
   s->len = 0;
@@ -42,12 +43,14 @@ void* curl_entry(void* param)
   while (1) {
     printf("curl thread wait unlock...\n");
 
+    pthread_mutex_lock( &signal_mutex );
+    pthread_cond_wait(&cond, &signal_mutex);
+    pthread_mutex_unlock(&signal_mutex);
 
     curl_global_init(CURL_GLOBAL_DEFAULT);
     curl = curl_easy_init();
     if(curl) {
       curlString s;
-      printf("pointer:%p, thread id:%x\n", &s, pthread_self());
       init_string(&s);
 
       //curl_easy_setopt(curl, CURLOPT_URL, "https://example.com/");
@@ -59,21 +62,21 @@ void* curl_entry(void* param)
       curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
       res = curl_easy_perform(curl);
 
-      if (res != CURLE_OK) {
-      }   
-      else {
+      if (res == CURLE_OK) {
         printf("==============\n");
         printf("%s\n", s.ptr);
         free(s.ptr);
         s.ptr=NULL;
       }   
+
+      pthread_mutex_lock( &signal_mutex );
+      tData.count++;
+      tData.done=1;
+      pthread_mutex_unlock(&signal_mutex);
+
       /* always cleanup */
       curl_easy_cleanup(curl);
     }   
     curl_global_cleanup();
-
-    pthread_mutex_lock( &signal_mutex );
-    pthread_cond_wait(&cond, &signal_mutex);
-    pthread_mutex_unlock(&signal_mutex);
   }
 }
