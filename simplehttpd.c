@@ -13,6 +13,7 @@
 #include "http_parser.h"
 #include "uthash.h"
 #include "common.h"
+#include "curlthread.h"
 
 #define array_size(x) (sizeof(x) / sizeof(x[0]))
 
@@ -468,6 +469,16 @@ int main (int argc, char **argv)
   FD_ZERO (&active_writefd_set);
   FD_SET (sock, &active_writefd_set);
 
+  //create thread to handle curl job
+  pthread_t curlThreadId;
+  curlString arg;
+  
+  if (pthread_create(&curlThreadId, NULL, curl_entry, &arg)) {
+    fprintf(stderr, "Error creating curl thread\n");
+    exit(1);
+  }
+
+
   while (1) {
     struct timeval tv;
     fd_set readfd_set;
@@ -565,110 +576,90 @@ int main (int argc, char **argv)
               FD_CLR (i, &active_writefd_set);
               FD_CLR (i, &active_readfd_set);
             }
-            else {
-#if 0
-              log_print("http header parse start");
-              int httpRet=http_header_parse(i, buffer, read_size);
-              if (httpRet<0) {
-                log_print("http header parse failure over");
-                FD_CLR (i, &active_writefd_set);
-                FD_CLR (i, &active_readfd_set);
-                close(i);
-              } else {
-                log_print("http header parse success over");
-                http_redir_response(i);
-                FD_CLR (i, &active_writefd_set);
-                FD_CLR (i, &active_readfd_set);
-                close(i);
-              }
-              FD_CLR (i, &active_writefd_set);
-              FD_CLR(i, &active_readfd_set);
-#else
-             //handle ssl handshake
-             BIO *pInBio = SSL_get_rbio(client_ssl[i]);
-             BIO_write(pInBio, buffer, read_size);
-             if (ssl_finished[i]) {
-               //printf("SSL_read, ssl finished, raise write select event to close fd:%d\n", i);
-               char data[280]={0};
-               snprintf(data, sizeof(data), "%s", "HTTP/1.1 200 OK\r\nContent-Length: 30\r\nServer: EKRServer\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<html><body>abcd</body></html>");
-               int sslWriteRet=SSL_write(client_ssl[i], data, sizeof(data));
+            else {//read_size>0
+              //handle ssl handshake
+              BIO *pInBio = SSL_get_rbio(client_ssl[i]);
+              BIO_write(pInBio, buffer, read_size);
 
-               if (sslWriteRet<=0) { //error
-                 int sslerror=SSL_get_error(client_ssl[i], sslWriteRet);
-                 printf("[sslWriteRet] sslerror:%d, sslWriteRet:%d, sizeof(data):%d, socket:%d\n", sslerror, sslWriteRet, sizeof(data), i);
-                 close(i);
-                 SSL_free(client_ssl[i]);                                          
-                 client_ssl[i]=NULL;
-                 ssl_finished[i]=0;     
-                 writefd_clear[i]=0;
-                 FD_CLR(i, &active_readfd_set);
-                 FD_CLR(i, &active_writefd_set);
-                 break;
-               }
-               else {
-                 //performIO                                                        
-                 BIO *pOutBio= SSL_get_wbio(client_ssl[i]);                         
-                 int bioAvailable=BIO_pending(pOutBio);                             
-                 //printf("complete bioAvailable :%d\n", bioAvailable);               
-                 if (bioAvailable<0) {                                              
-                   //printf("complete bioAvailable failed");                          
-                 }                                                                  
-                 else if (bioAvailable>0){
-                   char outBuffer[bioAvailable];                                 
-                   int written=BIO_read(pOutBio, outBuffer, bioAvailable);       
-                   //printf("complete written :%d\n", written);                    
-                   int result=send(i, outBuffer, bioAvailable, MSG_NOSIGNAL);
-                   //printf("complete send result:%d\n", result);                  
-                   if (written==result) {
-                     writefd_clear[i]=1; //set flag to let write event finished it. clear it when next wait event
-                   }
- 
-                 }
-               }
+              if (!ssl_finished[i]) {
+                int errorCode=SSL_accept(client_ssl[i]);
+                if (errorCode < 0) {                                               
+                  int sslError = SSL_get_error(client_ssl[i], errorCode);             
+                  if (sslError != SSL_ERROR_WANT_READ && sslError != SSL_ERROR_WANT_WRITE) {
+                    //printf("SSL_read, unable to accept SSL connection: %d", sslError);
+                    close(i);
+                    SSL_free(client_ssl[i]);
+                    client_ssl[i]=NULL;
+                    ssl_finished[i]=0;     
+                    writefd_clear[i]=0;
+                    FD_CLR(i, &active_readfd_set);
+                    FD_CLR(i, &active_writefd_set);
+                    break;
+                  }                                                         
+                }   
 
-             }
-             else {
-               int errorCode=SSL_accept(client_ssl[i]);
+                //Perform IO
+                BIO *pOutBio= SSL_get_wbio(client_ssl[i]);
+                int bioAvailable=BIO_pending(pOutBio);
+                if (bioAvailable<0) {                                              
+                  printf("bioAvailable failed:%d\n", i);
+                  //log_print("bioAvailable failed");
+                  close(i);
+                  SSL_free(client_ssl[i]);
+                  client_ssl[i]=NULL;
+                  ssl_finished[i]=0;       
+                  writefd_clear[i]=0;
+                  FD_CLR(i, &active_writefd_set);
+                  FD_CLR(i, &active_readfd_set);
+                }                                                                  
+                else if (bioAvailable>0){                                          
+                  char outBuffer[bioAvailable];                                    
+                  int written=BIO_read(pOutBio, outBuffer, bioAvailable);          
+                  send(i, outBuffer, bioAvailable, MSG_NOSIGNAL);
+                  ssl_finished[i]=SSL_is_init_finished(client_ssl[i]);       
+                }                                                                  
+              }//ssl is not finished
 
-               if (errorCode < 0) {                                               
-                 int sslError = SSL_get_error(client_ssl[i], errorCode);             
-                 if (sslError != SSL_ERROR_WANT_READ && sslError != SSL_ERROR_WANT_WRITE) {
-                   //printf("SSL_read, unable to accept SSL connection: %d", sslError);
-                   close(i);
-                   SSL_free(client_ssl[i]);
-                   client_ssl[i]=NULL;
-                   ssl_finished[i]=0;     
-                   writefd_clear[i]=0;
-                   FD_CLR(i, &active_readfd_set);
-                   FD_CLR(i, &active_writefd_set);
-                   break;
-                 }                                                         
-               }   
+              else {
+                char data[280]={0};
+                snprintf(data, sizeof(data), "%s", "HTTP/1.1 200 OK\r\nContent-Length: 30\r\nServer: EKRServer\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<html><body>abcd</body></html>");
+                int sslWriteRet=SSL_write(client_ssl[i], data, sizeof(data));
 
-               //Perform IO
-               BIO *pOutBio= SSL_get_wbio(client_ssl[i]);
-               int bioAvailable=BIO_pending(pOutBio);
-               if (bioAvailable<0) {                                              
-                 printf("bioAvailable failed:%d\n", i);
-                 //log_print("bioAvailable failed");
-                 close(i);
-                 SSL_free(client_ssl[i]);
-                 client_ssl[i]=NULL;
-                 ssl_finished[i]=0;       
-                 writefd_clear[i]=0;
-                 FD_CLR(i, &active_writefd_set);
-                 FD_CLR(i, &active_readfd_set);
-               }                                                                  
-               else if (bioAvailable>0){                                          
-                 char outBuffer[bioAvailable];                                    
-                 int written=BIO_read(pOutBio, outBuffer, bioAvailable);          
-                 send(i, outBuffer, bioAvailable, MSG_NOSIGNAL);
-                 ssl_finished[i]=SSL_is_init_finished(client_ssl[i]);       
-               }                                                                  
-             }
-#endif
-            }
-          }
+                if (sslWriteRet<=0) { //error
+                  int sslerror=SSL_get_error(client_ssl[i], sslWriteRet);
+                  printf("[sslWriteRet] sslerror:%d, sslWriteRet:%d, sizeof(data):%d, socket:%d\n", sslerror, sslWriteRet, sizeof(data), i);
+                  close(i);
+                  SSL_free(client_ssl[i]);                                          
+                  client_ssl[i]=NULL;
+                  ssl_finished[i]=0;     
+                  writefd_clear[i]=0;
+                  FD_CLR(i, &active_readfd_set);
+                  FD_CLR(i, &active_writefd_set);
+                  break;
+                }
+                else {
+                  //performIO                                                        
+                  BIO *pOutBio= SSL_get_wbio(client_ssl[i]);                         
+                  int bioAvailable=BIO_pending(pOutBio);                             
+                  //printf("complete bioAvailable :%d\n", bioAvailable);               
+                  if (bioAvailable<0) {                                              
+                    //printf("complete bioAvailable failed");                          
+                  }                                                                  
+                  else if (bioAvailable>0){
+                    char outBuffer[bioAvailable];                                 
+                    int written=BIO_read(pOutBio, outBuffer, bioAvailable);       
+                    //printf("complete written :%d\n", written);                    
+                    int result=send(i, outBuffer, bioAvailable, MSG_NOSIGNAL);
+                    //printf("complete send result:%d\n", result);                  
+                    if (written==result) {
+                      writefd_clear[i]=1; //set flag to let write event finished it. clear it when next wait event
+                    }
+                  }
+                }
+              }//ssl finished
+
+            }//read_size>0
+          }//accepted connection socket
         }//read fd set
 
         if (FD_ISSET (i, &writefd_set)) {
@@ -690,8 +681,12 @@ int main (int argc, char **argv)
             }
           }
 	}//write fd set
+
       }//for loop
     }//select 
 
   }//while
 }
+
+
+
