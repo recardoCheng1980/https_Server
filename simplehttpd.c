@@ -6,6 +6,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <sys/un.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <ctype.h>
@@ -518,6 +519,41 @@ void shutdownConnection(int fd) {
   ssl_finished[fd]=0;    
 }
 
+int createDomainSocket() {
+  int domainSocket=0;
+  struct sockaddr_un address;
+
+  unlink(SOCK_PATH);
+  //create a master socket
+  if( (domainSocket = socket(AF_UNIX , SOCK_STREAM , 0)) == 0) 
+  {
+      perror("socket failed");
+      exit(EXIT_FAILURE);
+  }
+  
+  
+   //type of socket created
+  address.sun_family = AF_UNIX;
+  strcpy(address.sun_path, SOCK_PATH);
+    
+  size_t len = strlen(address.sun_path) + sizeof(address.sun_family);
+  
+  if (bind(domainSocket, (struct sockaddr *)&address, len)<0) 
+  {
+      perror("bind failed");
+      exit(EXIT_FAILURE);
+  }
+  printf("Listener on port %s \n", SOCK_PATH);
+
+  if (listen(domainSocket, 32) < 0)
+  {
+      perror("listen");
+      exit(EXIT_FAILURE);
+  }
+
+  return domainSocket;
+}
+
 int main (int argc, char **argv)
 {
   int sock;
@@ -571,11 +607,17 @@ int main (int argc, char **argv)
     exit (EXIT_FAILURE);
   }
 
+  //Add domainSocket
+  int domainSocket=createDomainSocket();
+
   /* Initialize the set of active sockets. */
   FD_ZERO (&active_readfd_set);
   FD_SET (sock, &active_readfd_set);
+  FD_SET (domainSocket, &active_readfd_set);
+
   FD_ZERO (&active_writefd_set);
   FD_SET (sock, &active_writefd_set);
+
 
   //create thread to handle curl job
   pthread_t curlThreadId;
@@ -616,22 +658,26 @@ int main (int argc, char **argv)
       /* Service all the sockets with input pending. */
       for (i = 0; i < FD_SETSIZE; ++i) {
         if (FD_ISSET (i, &readfd_set)) {
-          if (i == sock) {
+          if (i == domainSocket) {
+            printf("domain socket connection\n");
+            struct sockaddr_in udsaddress;
+            size_t addrlen = sizeof(udsaddress);
+            int domainSocketNew = accept (domainSocket, (struct sockaddr *) &udsaddress, &addrlen);
+            printf("new uds socket accpeted\n");
+//            close(domainSocketNew);
+          }
+          else if (i == sock) {
             /* Connection request on original socket. */
             struct sockaddr_in clientname;
             int new;
 
             size = sizeof (clientname);
             new = accept (sock, (struct sockaddr *) &clientname, &size);
-            //setFdOptions(new); 
             if (new < 0) {
               log_print("accept error, exit");
-              sleep(1);
               exit (EXIT_FAILURE);
             }
-
             client_ssl[new] = SSL_new(ctx); 
-            //sanity check if SSL_new is success
             SSL_set_bio(client_ssl[new], BIO_new(BIO_s_mem()), BIO_new(BIO_s_mem()));
             printf("New socket:%d, ssl:%p, ssl_finished:%d, write_clear:%d\n" , new, client_ssl[new], ssl_finished[new],  writefd_clear[new]);
             FD_SET (new, &active_readfd_set);
@@ -640,15 +686,12 @@ int main (int argc, char **argv)
             int err=SSL_accept(client_ssl[new]);
             int sslerror=SSL_get_error(client_ssl[new], err);
             if (sslerror==SSL_ERROR_WANT_READ) {
-              //log_print("SSL_accept ERROR WANT READ");
               printf("SSL_accept ERROR WANT READ:%d\n", new);
             }
             else if (sslerror==SSL_ERROR_WANT_WRITE) {                             
-              //log_print("SSL_accept ERROR WANT WRITE");                                     
               printf("SSL_accept ERROR WANT WRITE:%d\n", new);
             }
             else if (sslerror==SSL_ERROR_NONE) {
-              //log_print("SLL_accept ERROR NONE");
               printf("SSL_accept ERROR NONE:%d\n", new);
             }   
 
